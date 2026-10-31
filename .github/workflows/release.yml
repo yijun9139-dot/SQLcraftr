@@ -1,0 +1,180 @@
+# 推送到 main：只跑测试。
+# 推送标签 v1.1.1（必须等于 package.json 的 version）：测试、打包、发布 Release。
+# 手动运行只接受 main。勾选发布时，inputs.release 是字符串 "true" / "false"。
+# Mac 包在 macOS 上打，Windows 包在 Windows 上打，这样 mysql2 的原生模块对得上系统。
+# 安装包没有签名。CSC_IDENTITY_AUTO_DISCOVERY 关掉，避免在钥匙串上一直等待。
+
+name: Check and release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "把安装包挂到 GitHub Release（标签为 v 加 package.json 版本号）"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: node_app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: node_app/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - name: Tag matches package.json
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          ver=$(node --input-type=module -e "import {readFileSync} from 'node:fs'; process.stdout.write(JSON.parse(readFileSync('package.json','utf8')).version)")
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$ver" != "$tag" ]; then
+            echo "标签 v$tag 和 package.json 的版本 $ver 不一致。先改版本号并提交，再打同样的标签。"
+            exit 1
+          fi
+
+  pack-mac:
+    name: Pack macOS
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    runs-on: macos-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: node_app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: node_app/package-lock.json
+      - run: npm ci
+      - name: Pack macOS
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npm run pack:mac
+      - name: List installers
+        run: ls -lh dist/*.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sql-joiner-mac
+          if-no-files-found: error
+          path: node_app/dist/*.dmg
+
+  pack-win:
+    name: Pack Windows
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: node_app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: node_app/package-lock.json
+      - run: npm ci
+      - name: Pack Windows
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npm run pack:win
+      - name: List installers
+        shell: bash
+        run: ls -lh dist/*.exe dist/*.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sql-joiner-win
+          if-no-files-found: error
+          path: |
+            node_app/dist/*.exe
+            node_app/dist/*.zip
+
+  release:
+    name: Publish Release
+    needs: [pack-mac, pack-win]
+    if: always() && needs.pack-mac.result == 'success' && needs.pack-win.result == 'success' && (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: node_app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sql-joiner-*
+          path: installers
+          merge-multiple: true
+      - name: Read version
+        id: ver
+        run: |
+          ver=$(node --input-type=module -e "import {readFileSync} from 'node:fs'; process.stdout.write(JSON.parse(readFileSync('package.json','utf8')).version)")
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "tag=v$ver" >> "$GITHUB_OUTPUT"
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: SQL Joiner ${{ steps.ver.outputs.version }}
+          generate_release_notes: true
+          files: |
+            installers/*.dmg
+            installers/*.exe
+            installers/*.zip
+          body: |
+            SQL Joiner ${{ steps.ver.outputs.version }}。安装包没有代码签名，也没有苹果公证。
+
+            下载名里的空格会显示成点。装好后的应用名仍是 SQL Joiner。
+
+            - Apple 芯片的 Mac：`SQL.Joiner-${{ steps.ver.outputs.version }}-arm64.dmg`
+            - Intel Mac：`SQL.Joiner-${{ steps.ver.outputs.version }}.dmg`
+            - Windows 安装程序：`SQL.Joiner.Setup.${{ steps.ver.outputs.version }}.exe`
+            - Windows 压缩包：`SQL.Joiner-${{ steps.ver.outputs.version }}-win.zip`
+
+            ## Mac：没有签名时怎么打开
+
+            从这里下载的 dmg 会被 macOS 标成隔离文件。第一次打开可能提示「已损坏，无法打开」或「无法验证开发者」。安装包没有坏，不要移到废纸篓。
+
+            1. 打开 dmg，把 SQL Joiner 拖到「应用程序」。已经装过的话，先用菜单栏退出旧的 SQL Joiner，再替换。
+            2. 打开「终端」，粘贴下面这一行后回车，去掉隔离标记：
+
+               ```
+               xattr -dr com.apple.quarantine "/Applications/SQL Joiner.app"
+               ```
+
+            3. 从「应用程序」或启动台打开 SQL Joiner。
+            4. 如果还是提示无法验证开发者：在 Finder 里按住 Control 点 SQL Joiner，选择「打开」，再点对话框里的「打开」。也可以到「系统设置 → 隐私与安全性」，点「仍要打开」。
+
+            Apple 芯片下载带 `-arm64` 的 dmg。Intel Mac 下载不带 `-arm64` 的那个。
+
+            ## Windows
+
+            安装程序没有微软签名。若出现 SmartScreen，选择「仍要运行」。安装时如果旧版本还开着，安装程序会结束 `SQL Joiner.exe` 再覆盖文件。
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

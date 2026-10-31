@@ -1,0 +1,13 @@
+.idea/
+.claude/
+storage/
+Archive.7z
+
+planning/features/
+
+node_modules/
+dist/
+php-bin/
+
+/package-lock.json
+.bash_aliases
